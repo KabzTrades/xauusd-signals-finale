@@ -1,1 +1,0 @@
-# xauusd-signals-finale
