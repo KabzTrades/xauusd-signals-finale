@@ -65,6 +65,60 @@ SESSION_WINDOWS = {
     "ny_afternoon_start": 16, "ny_afternoon_end": 21,
 }
 
+# ---------------------------------------------------------------------------
+# Module 4 - Signal Scoring Engine constants
+#
+# Every number below is a STARTING DEFAULT, not a validated finding - same
+# principle as everywhere else in this build. These get replaced with real
+# numbers once Module 7 (walk-forward validation against actual historical
+# data) has something to say about them. Nothing here should be read as
+# "the edge" - it's the scaffolding the edge gets measured against.
+# ---------------------------------------------------------------------------
+
+# Hard gates - any failure means no signal at all, regardless of score.
+ADX_GATE_FLOOR = 22.0             # ADX(H1) below this -> regime not trending, no signal
+ATR_PCT_GATE_FLOOR = 30.0         # ATR percentile below this -> too quiet/chop, suppress
+ATR_PCT_GATE_CEILING = 95.0       # ATR percentile above this -> likely news-spike/illiquid, suppress
+
+# Continuous scoring scales (0-100), only evaluated once gates pass.
+ADX_SCORE_ZERO = 15.0             # ADX at/below this -> regime score 0
+ADX_SCORE_FULL = 40.0             # ADX at/above this -> regime score 100
+TREND_SLOPE_SCORE_CAP = 0.30      # abs(EMA slope %) at/above this -> trend score 100
+MOMENTUM_ROC_SCORE_CAP = 0.50     # signed ROC % at/above this -> momentum score 100
+ATR_PCT_SCORE_PEAK_LOW = 50.0     # volatility score = 100 within this band -
+ATR_PCT_SCORE_PEAK_HIGH = 80.0    # constructive expansion, not chop, not a spike
+
+SESSION_SCORES = {
+    "London/NY Overlap": 100.0,
+    "London Open": 80.0,
+    "NY Afternoon": 60.0,
+    "Asia": 30.0,
+    "Off Hours": 10.0,
+}
+
+# Composite weights - sum to 1.0. Trend and Structure weighted highest since
+# they carry the most direct directional evidence; Regime/Momentum next;
+# Volatility/Session are context modifiers. Reweighted in Module 7 based on
+# which components actually predict out-of-sample outcomes, not intuition.
+SCORE_WEIGHTS = {
+    "regime": 0.15,
+    "trend": 0.25,
+    "momentum": 0.15,
+    "volatility": 0.10,
+    "structure": 0.25,
+    "session": 0.10,
+}
+
+MIN_RISK_REWARD = 1.5
+ATR_STOP_MULTIPLIER = 1.2
+
+# Fixed hard floor for now. The taper mechanism discussed earlier (bounded
+# floor-drift toward a daily signal-count target) needs state persisted
+# across runs - GitHub Actions gives each run a clean slate, so there's no
+# "how many signals fired today" to taper against yet. That's Module 9
+# (performance tracking / signal journal). Until then: fixed floor, no quota.
+PUBLISH_FLOOR = 78.0
+
 
 # ---------------------------------------------------------------------------
 # Data source: Twelve Data free REST API
@@ -306,6 +360,150 @@ def compute_features(m5_df: pd.DataFrame, h1_df: pd.DataFrame) -> dict:
 
 
 # ---------------------------------------------------------------------------
+# Signal scoring engine (Module 4)
+#
+# Regime is a hard gate, not a score - no signal is even evaluated below the
+# ADX/ATR floors. Direction requires M5 trend and H1 bias to agree - a
+# conflict between them means no candidate at all, not a low-confidence one.
+# Only once both pass does the composite score get computed.
+# ---------------------------------------------------------------------------
+
+def _clip(value: float, lo: float = 0.0, hi: float = 100.0) -> float:
+    return max(lo, min(hi, value))
+
+
+def determine_candidate_direction(features: dict):
+    trend_dir = features["trend_direction"]
+    htf_dir = features["htf_bias"]
+    if trend_dir != htf_dir:
+        return None
+    return "BUY" if trend_dir == "Bullish" else "SELL"
+
+
+def check_regime_gate(features: dict):
+    adx = features["adx_h1"]
+    atr_pct = features["atr_percentile"]
+    if adx < ADX_GATE_FLOOR:
+        return False, f"ADX(H1) {adx} below trend floor {ADX_GATE_FLOOR}"
+    if atr_pct < ATR_PCT_GATE_FLOOR:
+        return False, f"ATR percentile {atr_pct} below floor {ATR_PCT_GATE_FLOOR} (chop)"
+    if atr_pct > ATR_PCT_GATE_CEILING:
+        return False, f"ATR percentile {atr_pct} above ceiling {ATR_PCT_GATE_CEILING} (illiquid/news-spike)"
+    return True, "regime gate passed"
+
+
+def score_regime(adx_h1: float) -> float:
+    if adx_h1 <= ADX_SCORE_ZERO:
+        return 0.0
+    if adx_h1 >= ADX_SCORE_FULL:
+        return 100.0
+    return _clip((adx_h1 - ADX_SCORE_ZERO) / (ADX_SCORE_FULL - ADX_SCORE_ZERO) * 100)
+
+
+def score_trend(slope_pct: float) -> float:
+    return _clip(abs(slope_pct) / TREND_SLOPE_SCORE_CAP * 100)
+
+
+def score_momentum(roc_pct: float, direction: str) -> float:
+    """Only rewards momentum agreeing with the candidate direction; scores 0 if it opposes."""
+    signed = roc_pct if direction == "BUY" else -roc_pct
+    if signed <= 0:
+        return 0.0
+    return _clip(signed / MOMENTUM_ROC_SCORE_CAP * 100)
+
+
+def score_volatility(atr_percentile: float) -> float:
+    """Triangular peak: constructive expansion scores highest, tapering toward both gate edges."""
+    if ATR_PCT_SCORE_PEAK_LOW <= atr_percentile <= ATR_PCT_SCORE_PEAK_HIGH:
+        return 100.0
+    if atr_percentile < ATR_PCT_SCORE_PEAK_LOW:
+        span = ATR_PCT_SCORE_PEAK_LOW - ATR_PCT_GATE_FLOOR
+        return _clip((atr_percentile - ATR_PCT_GATE_FLOOR) / span * 100) if span > 0 else 100.0
+    span = ATR_PCT_GATE_CEILING - ATR_PCT_SCORE_PEAK_HIGH
+    return _clip((ATR_PCT_GATE_CEILING - atr_percentile) / span * 100) if span > 0 else 100.0
+
+
+def score_structure(structure: dict, direction: str) -> float:
+    agreeing_reclaim = structure["bullish_reclaim"] if direction == "BUY" else structure["bearish_reclaim"]
+    opposing_reclaim = structure["bearish_reclaim"] if direction == "BUY" else structure["bullish_reclaim"]
+    if agreeing_reclaim:
+        return 100.0
+    if opposing_reclaim:
+        return 0.0
+    if structure["swept_high"] or structure["swept_low"]:
+        return 40.0
+    return 50.0
+
+
+def score_session(session: str) -> float:
+    return SESSION_SCORES.get(session, 10.0)
+
+
+def compute_composite_score(features: dict, direction: str) -> dict:
+    scores = {
+        "regime": score_regime(features["adx_h1"]),
+        "trend": score_trend(features["trend_slope_pct"]),
+        "momentum": score_momentum(features["roc_pct"], direction),
+        "volatility": score_volatility(features["atr_percentile"]),
+        "structure": score_structure(features["structure"], direction),
+        "session": score_session(features["session"]),
+    }
+    composite = sum(scores[k] * SCORE_WEIGHTS[k] for k in SCORE_WEIGHTS)
+    return {"breakdown": scores, "composite": composite}
+
+
+def estimate_trade_levels(price: float, atr: float, direction: str) -> dict:
+    """
+    Provisional ATR-based SL/TP for R:R gating only - NOT the final risk
+    engine. Module 5 replaces this with structure-aware stop placement,
+    which is also why R:R always shows exactly MIN_RISK_REWARD right now:
+    TP is derived directly from SL * that ratio, not from an independent
+    target. That stops being true once Module 5 lands.
+    """
+    sl_distance = atr * ATR_STOP_MULTIPLIER
+    tp_distance = sl_distance * MIN_RISK_REWARD
+    if direction == "BUY":
+        return {"entry": price, "stop_loss": price - sl_distance, "take_profit": price + tp_distance}
+    return {"entry": price, "stop_loss": price + sl_distance, "take_profit": price - tp_distance}
+
+
+def evaluate_signal(price: float, features: dict) -> dict:
+    """
+    Always returns a result describing what happened, whether or not a
+    signal actually fires - used both to publish real signals and to show
+    diagnostic scoring during this build/validation phase. Once the system
+    is validated, production behavior goes silent on non-fires; showing the
+    reasoning now is deliberate, for verifying the engine before trusting it.
+    """
+    direction = determine_candidate_direction(features)
+    if direction is None:
+        return {"fired": False, "direction": None, "confidence": None, "breakdown": None,
+                "reason": "M5/H1 trend conflict - no directional candidate"}
+
+    gate_ok, gate_reason = check_regime_gate(features)
+    if not gate_ok:
+        return {"fired": False, "direction": direction, "confidence": None, "breakdown": None,
+                "reason": gate_reason}
+
+    scoring = compute_composite_score(features, direction)
+    levels = estimate_trade_levels(price, features["atr_m5"], direction)
+    risk = abs(levels["entry"] - levels["stop_loss"])
+    reward = abs(levels["take_profit"] - levels["entry"])
+    risk_reward = reward / risk if risk > 0 else 0.0
+
+    fired = scoring["composite"] >= PUBLISH_FLOOR
+    return {
+        "fired": fired,
+        "direction": direction,
+        "confidence": round(scoring["composite"], 1),
+        "breakdown": {k: round(v, 1) for k, v in scoring["breakdown"].items()},
+        "levels": levels,
+        "risk_reward": round(risk_reward, 2),
+        "reason": None if fired else f"confidence {scoring['composite']:.1f} below publish floor {PUBLISH_FLOOR}",
+    }
+
+
+# ---------------------------------------------------------------------------
 # Delivery: Telegram Bot API
 # ---------------------------------------------------------------------------
 
@@ -347,33 +545,65 @@ def send_telegram_message(token: str, chat_id: str, text: str, max_retries: int 
 # Entry point
 # ---------------------------------------------------------------------------
 
-def format_feature_message(price: float, features: dict) -> str:
+def _build_reason(direction: str, features: dict) -> str:
+    direction_word = "bullish" if direction == "BUY" else "bearish"
+    bits = [
+        f"H1 ADX {features['adx_h1']} confirms trending regime",
+        f"M5/H1 trend aligned {direction_word} (slope {features['trend_slope_pct']:+.2f}%)",
+    ]
     s = features["structure"]
-    structure_line = "None detected"
-    if s["bullish_reclaim"]:
-        structure_line = f"Bullish reclaim (swept {s['prior_low']:.2f}, closed back above)"
-    elif s["bearish_reclaim"]:
-        structure_line = f"Bearish reclaim (swept {s['prior_high']:.2f}, closed back below)"
-    elif s["swept_high"] or s["swept_low"]:
-        structure_line = "Swept, no reclaim yet"
+    if (direction == "BUY" and s["bullish_reclaim"]) or (direction == "SELL" and s["bearish_reclaim"]):
+        bits.append("confirmed by liquidity-sweep reclaim")
+    bits.append(f"{features['session']} session")
+    return "; ".join(bits) + "."
 
+
+def format_signal_message(evaluation: dict, features: dict) -> str:
+    direction = evaluation["direction"]
+    levels = evaluation["levels"]
+    b = evaluation["breakdown"]
+    emoji = "\U0001F680" if direction == "BUY" else "\U0001F53B"
+    invalidation_dir = "below" if direction == "BUY" else "above"
+    htf_flip = "bearish" if direction == "BUY" else "bullish"
     checked_at = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
+
     return (
-        f"\U0001F4CA <b>{INSTRUMENT} feature snapshot</b>\n\n"
-        f"Price: {price:.2f}\n"
-        f"Session: {features['session']}\n\n"
-        f"ADX(H1): {features['adx_h1']}\n"
-        f"Trend (M5 EMA{EMA_FAST}/{EMA_SLOW}): {features['trend_direction']} "
-        f"(slope {features['trend_slope_pct']:+.2f}%)\n"
-        f"HTF bias (H1): {features['htf_bias']}\n"
-        f"ATR(M5): {features['atr_m5']} ({features['atr_percentile']}th percentile)\n"
-        f"VWAP dev: {features['vwap_deviation_atr']:+.2f} ATR\n"
-        f"ROC: {features['roc_pct']:+.2f}%\n"
-        f"Structure: {structure_line}\n\n"
-        f"Checked: {checked_at}\n\n"
-        f"<i>Feature engine only - no scoring or threshold applied yet, "
-        f"so this is not a trade signal.</i>"
+        f"{emoji} <b>{direction} {INSTRUMENT}</b>\n\n"
+        f"Entry: {levels['entry']:.2f}\n"
+        f"Stop Loss: {levels['stop_loss']:.2f}\n"
+        f"Take Profit: {levels['take_profit']:.2f}\n"
+        f"Risk Reward: 1:{evaluation['risk_reward']:.1f}\n"
+        f"Confidence: {evaluation['confidence']:.0f}%\n\n"
+        f"Market Regime:\nTrending\n\n"
+        f"Reason:\n{_build_reason(direction, features)}\n\n"
+        f"Invalidation:\nClose back {invalidation_dir} {levels['stop_loss']:.2f} on M5, "
+        f"or H1 bias flips {htf_flip}\n\n"
+        f"<i>Regime {b['regime']:.0f} / Trend {b['trend']:.0f} / Momentum {b['momentum']:.0f} / "
+        f"Volatility {b['volatility']:.0f} / Structure {b['structure']:.0f} / Session {b['session']:.0f}</i>\n\n"
+        f"<i>{checked_at}</i>"
     )
+
+
+def format_no_signal_message(price: float, evaluation: dict, features: dict) -> str:
+    checked_at = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
+    lines = [
+        f"\u26AA <b>{INSTRUMENT} - no signal</b>\n",
+        f"Price: {price:.2f}",
+        f"Session: {features['session']}",
+        f"Reason: {evaluation['reason']}",
+    ]
+    if evaluation["breakdown"] is not None:
+        b = evaluation["breakdown"]
+        lines.append(
+            f"\nRegime {b['regime']:.0f} / Trend {b['trend']:.0f} / Momentum {b['momentum']:.0f} / "
+            f"Volatility {b['volatility']:.0f} / Structure {b['structure']:.0f} / Session {b['session']:.0f}"
+        )
+    lines.append(f"\nChecked: {checked_at}")
+    lines.append(
+        "\n<i>Diagnostic output during validation - once calibrated, "
+        "production stays silent on no-signal runs instead of messaging every cycle.</i>"
+    )
+    return "\n".join(lines)
 
 
 def main() -> None:
@@ -382,10 +612,15 @@ def main() -> None:
     h1_df = get_time_series_df(TWELVEDATA_SYMBOL, "1h", H1_BAR_COUNT, TWELVEDATA_API_KEY)
 
     features = compute_features(m5_df, h1_df)
-    message = format_feature_message(price, features)
+    evaluation = evaluate_signal(price, features)
+
+    if evaluation["fired"]:
+        message = format_signal_message(evaluation, features)
+    else:
+        message = format_no_signal_message(price, evaluation, features)
 
     send_telegram_message(TELEGRAM_BOT_TOKEN, TELEGRAM_CHAT_ID, message)
-    print(f"Feature snapshot sent: {INSTRUMENT} @ {price} | {features}")
+    print(f"Evaluated: {INSTRUMENT} @ {price} | fired={evaluation['fired']} | {evaluation}")
 
 
 if __name__ == "__main__":
