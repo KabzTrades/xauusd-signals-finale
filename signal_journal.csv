@@ -1,0 +1,2 @@
+timestamp_utc,instrument,fired,direction,confidence,entry,stop_loss,take_profit,risk_reward,reason
+2026-07-09 18:56:59,XAUUSD,False,BUY,,4123.5413,,,,ATR percentile 9.3 below floor 30.0 (chop)
